@@ -10,7 +10,7 @@ extern "C" {
 /// IOSurface id from the decoder (see hwcodec ffmpeg_vram_decode_mac.mm).
 void FlutterGpuTextureRendererPluginCApiSetTexture(void* output, void* texture) {
     GpuTextureOutput* gpu_texture = (__bridge GpuTextureOutput *)(output);
-    [gpu_texture markFrameAvaliableWithId:(int32_t)(uintptr_t)texture];
+    [gpu_texture markFrameAvaliableWithId:(uint32_t)(uintptr_t)texture];
 }
 
 #if __cplusplus

@@ -7,7 +7,7 @@ import CoreVideo
 @objc public class GpuTextureOutput: NSObject, FlutterTexture {
     public var textureId: Int64 = -1
     private var registry: FlutterTextureRegistry?
-    private var ioSurfaceId: IOSurfaceID = 0
+    private var ioSurfaceId: UInt32 = 0
     private let queue = DispatchQueue(label: "gpu_texture_output_sync_queue")
 
     public static func new(registry: FlutterTextureRegistry?) -> GpuTextureOutput {
@@ -17,7 +17,7 @@ import CoreVideo
         return output
     }
 
-    public func markFrameAvaliable(id: Int32) -> Bool {
+    public func markFrameAvaliable(id: UInt32) -> Bool {
         queue.sync {
             ioSurfaceId = id
         }
@@ -40,7 +40,10 @@ import CoreVideo
             CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nil as CFDictionary?, &pixelBuffer)
             ioSurface.release()
         }
-        return pixelBuffer.map { Unmanaged.passRetained($0) }
+        guard let pixelBuffer = pixelBuffer else {
+            return nil
+        }
+        return Unmanaged.passRetained(pixelBuffer)
     }
 }
 
