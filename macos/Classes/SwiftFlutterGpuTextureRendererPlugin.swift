@@ -17,7 +17,7 @@ import CoreVideo
         return output
     }
 
-    public func markFrameAvaliable(id: UInt32) -> Bool {
+    @objc public func markFrameAvaliable(id: UInt32) -> Bool {
         queue.sync {
             ioSurfaceId = id
         }
