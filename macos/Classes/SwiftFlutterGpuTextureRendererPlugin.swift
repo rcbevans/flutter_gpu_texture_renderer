@@ -44,31 +44,50 @@ import CoreVideo
         }
         return pixelBuffer
     }
+
+    public func unregister() {
+        registry?.unregisterTexture(textureId)
+        registry = nil
+    }
 }
 
+// One instance per flutter engine (each registrar registers its own), so
+// outputs die with their engine instead of living in a global map. The C API
+// addresses outputs by object pointer, which stays valid across engines.
 public class FlutterGpuTextureRendererPlugin: NSObject, FlutterPlugin {
-    // Object pointers handed across the FFI, keyed by texture registry id.
-    private static var outputs: [Int64: GpuTextureOutput] = [:]
-    private static var textureRegistry: FlutterTextureRegistry?
+    private var outputs: [Int64: GpuTextureOutput] = [:]
+    private var textureRegistry: FlutterTextureRegistry?
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(
             name: "flutter_gpu_texture_renderer", binaryMessenger: registrar.messenger)
+        registrar.addMethodCallDelegate(
+            FlutterGpuTextureRendererPlugin(registrar: registrar), channel: channel)
+    }
+
+    init(registrar: FlutterPluginRegistrar) {
         textureRegistry = registrar.textures
-        registrar.addMethodCallDelegate(FlutterGpuTextureRendererPlugin(), channel: channel)
+        super.init()
+    }
+
+    deinit {
+        for output in outputs.values {
+            output.unregister()
+        }
+        outputs.removeAll()
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "registerTexture":
-            let output = GpuTextureOutput.new(registry: FlutterGpuTextureRendererPlugin.textureRegistry)
-            FlutterGpuTextureRendererPlugin.outputs[output.textureId] = output
+            let output = GpuTextureOutput.new(registry: textureRegistry)
+            outputs[output.textureId] = output
             result(output.textureId)
         case "unregisterTexture":
             let args = call.arguments as! [String: Any]
             let id = args["id"] as! Int64
-            if let output = FlutterGpuTextureRendererPlugin.outputs.removeValue(forKey: id) {
-                FlutterGpuTextureRendererPlugin.textureRegistry?.unregisterTexture(output.textureId)
+            if let output = outputs.removeValue(forKey: id) {
+                output.unregister()
                 result(true)
             } else {
                 result(false)
@@ -76,7 +95,7 @@ public class FlutterGpuTextureRendererPlugin: NSObject, FlutterPlugin {
         case "output":
             let args = call.arguments as! [String: Any]
             let id = args["id"] as! Int64
-            let output = FlutterGpuTextureRendererPlugin.outputs[id]
+            let output = outputs[id]
             if output == nil {
                 result(0)
             } else {
