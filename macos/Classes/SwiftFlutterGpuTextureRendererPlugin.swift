@@ -26,7 +26,7 @@ import CoreVideo
     }
 
     public func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
-        var pixelBuffer: CVPixelBuffer?
+        var pixelBuffer: Unmanaged<CVPixelBuffer>?
         queue.sync {
             let surfaceId = ioSurfaceId
             if surfaceId == 0 {
@@ -37,13 +37,11 @@ import CoreVideo
             guard let ioSurface = IOSurfaceLookup(IOSurfaceID(surfaceId)) else {
                 return
             }
+            // The create hands back a +1 reference for the engine to own.
             CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nil as CFDictionary?, &pixelBuffer)
             ioSurface.release()
         }
-        guard let pixelBuffer = pixelBuffer else {
-            return nil
-        }
-        return Unmanaged.passRetained(pixelBuffer)
+        return pixelBuffer
     }
 }
 
