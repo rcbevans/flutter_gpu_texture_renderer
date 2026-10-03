@@ -32,10 +32,16 @@ static void gpu_texture_renderer_plugin_handle_method_call(
 
   if (strcmp(method, "registerTexture") == 0) {
     GpuTextureGL *texture = gpu_texture_gl_new(self->texture_registrar);
-    int64_t id = reinterpret_cast<int64_t>(FL_TEXTURE(texture));
-    g_output_map[id] = texture;
-    response = FL_METHOD_RESPONSE(fl_method_success_response_new(
-        fl_value_new_int(id)));
+    if (texture == nullptr) {
+      response = FL_METHOD_RESPONSE(
+          fl_method_error_response_new("registerTexture",
+                                       "Failed to register texture.", nullptr));
+    } else {
+      int64_t id = reinterpret_cast<int64_t>(FL_TEXTURE(texture));
+      g_output_map[id] = texture;
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(
+          fl_value_new_int(id)));
+    }
   } else if (strcmp(method, "unregisterTexture") == 0) {
     int64_t id = fl_value_get_int(fl_value_lookup_string(args, "id"));
     auto it = g_output_map.find(id);
@@ -45,22 +51,27 @@ static void gpu_texture_renderer_plugin_handle_method_call(
       g_object_unref(it->second);
       g_output_map.erase(it);
     }
-    response = FL_METHOD_RESPONSE(
-        fl_method_success_response_new(fl_value_new_bool(TRUE)));
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
   } else if (strcmp(method, "output") == 0) {
     int64_t id = fl_value_get_int(fl_value_lookup_string(args, "id"));
     auto it = g_output_map.find(id);
-    response = FL_METHOD_RESPONSE(fl_method_success_response_new(
-        fl_value_new_int(it != g_output_map.end()
-                             ? reinterpret_cast<int64_t>(it->second)
-                             : 0)));
+    if (it != g_output_map.end()) {
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(
+          fl_value_new_int(reinterpret_cast<int64_t>(it->second))));
+    } else {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "output", "Output not found.", nullptr));
+    }
   } else if (strcmp(method, "fps") == 0) {
     int64_t id = fl_value_get_int(fl_value_lookup_string(args, "id"));
     auto it = g_output_map.find(id);
-    response = FL_METHOD_RESPONSE(fl_method_success_response_new(
-        fl_value_new_int(it != g_output_map.end()
-                             ? (int64_t)gpu_texture_gl_take_fps(it->second)
-                             : 0)));
+    if (it != g_output_map.end()) {
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(
+          fl_value_new_int((int16_t)gpu_texture_gl_take_fps(it->second))));
+    } else {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "fps", "Output not found.", nullptr));
+    }
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }

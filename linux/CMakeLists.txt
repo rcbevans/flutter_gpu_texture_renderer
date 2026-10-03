@@ -38,6 +38,8 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::GTK)
+
+pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::EPOXY)
 
 # List of absolute paths to libraries that should be bundled with the plugin.

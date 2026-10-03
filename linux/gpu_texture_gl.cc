@@ -16,13 +16,19 @@ std::vector<GLuint> g_orphan_textures;
 std::vector<GLuint> g_orphan_framebuffers;
 std::vector<GLuint> g_orphan_programs;
 
-// Raw addresses of live textures; posts are validated against this set so a
-// frame racing unregistration is dropped instead of use-after-free.
+// Guards both the live set and, while held for a post, the whole post
+// (live-check + memcpy) so it cannot interleave with dispose freeing the
+// pending buffer. Populate only takes the per-texture mutex.
 std::mutex g_live_mutex;
 std::vector<GpuTextureGL *> g_live;
 
+// Sanity bounds; also keep stride arithmetic inside size_t without surprises.
+constexpr int kMaxFrameDim = 16384;
+constexpr int kMaxStride = 65536;
+
 GQuark gpu_texture_gl_error_quark() {
-  static GQuark quark = g_quark_from_static_string("flutter_gpu_texture_renderer");
+  static GQuark quark =
+      g_quark_from_static_string("flutter_gpu_texture_renderer");
   return quark;
 }
 
@@ -45,13 +51,14 @@ GLuint compile_shader(GLenum type, const char *source, GError **error) {
 
 GLuint link_program(GError **error) {
   // Fullscreen triangle from gl_VertexID: no buffers, valid in core and
-  // compatibility profiles.
+  // compatibility profiles. Covers NDC (-1,-1)..(1,1) with v_uv 0..1 over the
+  // viewport (uv beyond 1 lies outside the triangle).
   const char *vs =
       "#version 130\n"
       "out vec2 v_uv;\n"
       "void main() {\n"
       "  vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
-      "  gl_Position = vec4(pos - 1.0, 0.0, 1.0);\n"
+      "  gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
       "  v_uv = min(pos, 1.0);\n"
       "}\n";
   // BT.601 limited-range, matching the libyuv conversion of the software
@@ -103,6 +110,10 @@ GLuint link_program(GError **error) {
   glUseProgram(0);
   return program;
 }
+
+// The engine may populate before the first frame arrives; an incomplete or
+// 0-sized texture must never be handed to Skia.
+constexpr int kFallbackSize = 1;
 }  // namespace
 
 struct _GpuTextureGL {
@@ -112,7 +123,7 @@ struct _GpuTextureGL {
   // Pending frame, produced by post_nv12 (any thread), consumed by populate
   // (raster thread). One contiguous block: Y plane, then UV plane.
   uint8_t *pending;
-  int pending_capacity;
+  size_t pending_capacity;
   int y_stride;
   int uv_stride;
   int frame_width;
@@ -167,21 +178,32 @@ static void gpu_texture_gl_ensure_gl(GpuTextureGL *self, GError **error) {
   glGenFramebuffers(1, &self->fbo);
   self->program = link_program(error);
   if (self->program == 0) {
+    // Free the generated names so a later populate can retry cleanly.
+    glDeleteTextures(1, &self->y_tex);
+    glDeleteTextures(1, &self->uv_tex);
+    glDeleteTextures(1, &self->fbo_tex);
+    glDeleteFramebuffers(1, &self->fbo);
+    self->y_tex = 0;
+    self->uv_tex = 0;
+    self->fbo_tex = 0;
+    self->fbo = 0;
     return;
   }
+  for (GLuint tex : {self->y_tex, self->uv_tex, self->fbo_tex}) {
+    glBindTexture(GL_TEXTURE_2D, tex);
+    // Nearest: the fbo texture is scaled by Skia; chroma sampling must not
+    // smear before the conversion. No mip levels are generated.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  }
   glBindTexture(GL_TEXTURE_2D, self->fbo_tex);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kFallbackSize, kFallbackSize, 0,
+               GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
   glBindFramebuffer(GL_FRAMEBUFFER, self->fbo);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                          self->fbo_tex, 0);
-  // 1x1 defined storage: the engine may populate before the first frame
-  // arrives; sampling an incomplete texture is undefined.
-  glBindTexture(GL_TEXTURE_2D, self->fbo_tex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-               nullptr);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   self->tex_width = 0;
   self->tex_height = 0;
@@ -189,8 +211,10 @@ static void gpu_texture_gl_ensure_gl(GpuTextureGL *self, GError **error) {
 }
 
 // Uploads the pending frame and converts it in-shader into fbo_tex. Saves and
-// restores all GL state it touches; the engine has render state of its own.
+// restores all GL state it touches (per-unit bindings included); populate is
+// called mid-frame with Skia's render state current.
 static void gpu_texture_gl_upload_and_convert(GpuTextureGL *self) {
+  int uv_width = (self->frame_width + 1) / 2;
   int uv_height = (self->frame_height + 1) / 2;
   const uint8_t *uv_data =
       self->pending + (size_t)self->y_stride * self->frame_height;
@@ -201,16 +225,29 @@ static void gpu_texture_gl_upload_and_convert(GpuTextureGL *self) {
   glGetIntegerv(GL_VIEWPORT, prev_viewport);
   GLint prev_active = GL_TEXTURE0;
   glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
-  GLint prev_pixel_store_row = 0;
-  glGetIntegerv(GL_UNPACK_ROW_LENGTH, &prev_pixel_store_row);
-  GLint prev_pixel_store_align = 4;
-  glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_pixel_store_align);
+  GLint prev_row_length = 0;
+  glGetIntegerv(GL_UNPACK_ROW_LENGTH, &prev_row_length);
+  GLint prev_alignment = 4;
+  glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_alignment);
   GLint prev_program = 0;
   glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
+  GLint prev_unit0_tex = 0;
+  GLint prev_unit1_tex = 0;
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_unit0_tex);
+  glActiveTexture(GL_TEXTURE1);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_unit1_tex);
+  const GLenum prev_enable_bits[] = {GL_BLEND, GL_SCISSOR_TEST, GL_DEPTH_TEST,
+                                     GL_STENCIL_TEST, GL_CULL_FACE};
+  GLboolean prev_bits[5];
+  for (size_t i = 0; i < 5; i++) {
+    prev_bits[i] = glIsEnabled(prev_enable_bits[i]);
+  }
 
-  // Full spec on size change (re-specifies storage), sub-update otherwise.
   gboolean resize = self->frame_width != self->tex_width ||
                     self->frame_height != self->tex_height;
+
+  // GL_UNPACK_ROW_LENGTH is in pixels: GL_R8 is 1 byte/texel, GL_RG8 is 2.
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, self->y_tex);
   glPixelStorei(GL_UNPACK_ROW_LENGTH, self->y_stride);
@@ -226,15 +263,16 @@ static void gpu_texture_gl_upload_and_convert(GpuTextureGL *self) {
   }
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, self->uv_tex);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, self->uv_stride / 2);
   if (resize) {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, self->frame_width, uv_height, 0,
-                 GL_RG, GL_UNSIGNED_BYTE, uv_data);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, uv_width, uv_height, 0, GL_RG,
+                 GL_UNSIGNED_BYTE, uv_data);
   } else {
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self->frame_width, uv_height,
-                    GL_RG, GL_UNSIGNED_BYTE, uv_data);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_width, uv_height, GL_RG,
+                    GL_UNSIGNED_BYTE, uv_data);
   }
-  glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, prev_row_length);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, prev_alignment);
 
   if (resize) {
     self->tex_width = self->frame_width;
@@ -251,9 +289,21 @@ static void gpu_texture_gl_upload_and_convert(GpuTextureGL *self) {
   glBindTexture(GL_TEXTURE_2D, self->y_tex);
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, self->uv_tex);
+  for (GLenum bit : prev_enable_bits) {
+    glDisable(bit);
+  }
   glDrawArrays(GL_TRIANGLES, 0, 3);
+  for (size_t i = 0; i < 5; i++) {
+    if (prev_bits[i]) {
+      glEnable(prev_enable_bits[i]);
+    }
+  }
 
-  // Restore engine state.
+  // Restore engine state, per-unit bindings included (Skia caches them).
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, prev_unit1_tex);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, prev_unit0_tex);
   glActiveTexture(prev_active);
   glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo);
   glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2],
@@ -281,8 +331,10 @@ static gboolean gpu_texture_gl_populate(FlTextureGL *texture,
   }
   *target = GL_TEXTURE_2D;
   *name = self->fbo_tex;
-  *width = self->frame_width > 0 ? (uint32_t)self->frame_width : 1u;
-  *height = self->frame_height > 0 ? (uint32_t)self->frame_height : 1u;
+  *width = self->frame_width > 0 ? (uint32_t)self->frame_width
+                                 : (uint32_t)kFallbackSize;
+  *height = self->frame_height > 0 ? (uint32_t)self->frame_height
+                                   : (uint32_t)kFallbackSize;
   g_mutex_unlock(&self->mutex);
   return TRUE;
 }
@@ -290,8 +342,11 @@ static gboolean gpu_texture_gl_populate(FlTextureGL *texture,
 GpuTextureGL *gpu_texture_gl_new(FlTextureRegistrar *registrar) {
   GpuTextureGL *self =
       GPU_TEXTURE_GL(g_object_new(gpu_texture_gl_get_type(), nullptr));
+  if (!fl_texture_registrar_register_texture(registrar, FL_TEXTURE(self))) {
+    g_object_unref(self);
+    return nullptr;
+  }
   self->registrar = registrar;
-  fl_texture_registrar_register_texture(registrar, FL_TEXTURE(self));
   return self;
 }
 
@@ -302,28 +357,31 @@ void gpu_texture_gl_post_nv12(GpuTextureGL *self,
                               int uv_stride,
                               int width,
                               int height) {
-  if (width <= 0 || height <= 0 || y_stride <= 0 || uv_stride <= 0) {
+  if (width <= 0 || height <= 0 || y_stride <= 0 || uv_stride <= 0 ||
+      width > kMaxFrameDim || height > kMaxFrameDim ||
+      y_stride > kMaxStride || uv_stride > kMaxStride) {
     return;
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_live_mutex);
-    if (std::find(g_live.begin(), g_live.end(), self) == g_live.end()) {
-      return;  // output was unregistered; drop the frame
-    }
   }
   size_t y_size = (size_t)y_stride * height;
   size_t uv_size = (size_t)uv_stride * ((height + 1) / 2);
   size_t need = y_size + uv_size;
 
+  // Held for the whole post: the live check and the copy are atomic against
+  // dispose (which frees the pending buffer under the same lock).
+  std::lock_guard<std::mutex> lock(g_live_mutex);
+  if (std::find(g_live.begin(), g_live.end(), self) == g_live.end()) {
+    return;  // output was unregistered; drop the frame
+  }
+
   g_mutex_lock(&self->mutex);
-  if (self->pending_capacity < (int)need) {
+  if (self->pending_capacity < need) {
     uint8_t *grown = (uint8_t *)g_realloc(self->pending, need);
     if (grown == nullptr) {
       g_mutex_unlock(&self->mutex);
       return;
     }
     self->pending = grown;
-    self->pending_capacity = (int)need;
+    self->pending_capacity = need;
   }
   memcpy(self->pending, y, y_size);
   memcpy(self->pending + y_size, uv, uv_size);
@@ -345,10 +403,11 @@ uint32_t gpu_texture_gl_take_fps(GpuTextureGL *self) {
 
 static void gpu_texture_gl_dispose(GObject *object) {
   GpuTextureGL *self = GPU_TEXTURE_GL(object);
-  {
-    std::lock_guard<std::mutex> lock(g_live_mutex);
-    g_live.erase(std::remove(g_live.begin(), g_live.end(), self), g_live.end());
-  }
+  // Serializes against in-flight posts (g_live_mutex) and against populate
+  // (self->mutex) before the pending buffer and the GL names go away.
+  std::lock_guard<std::mutex> live_lock(g_live_mutex);
+  g_live.erase(std::remove(g_live.begin(), g_live.end(), self), g_live.end());
+  g_mutex_lock(&self->mutex);
   {
     std::lock_guard<std::mutex> lock(g_orphan_mutex);
     if (self->y_tex != 0) {
@@ -367,8 +426,14 @@ static void gpu_texture_gl_dispose(GObject *object) {
       g_orphan_programs.push_back(self->program);
     }
   }
+  self->y_tex = 0;
+  self->uv_tex = 0;
+  self->fbo_tex = 0;
+  self->fbo = 0;
+  self->program = 0;
   g_clear_pointer(&self->pending, g_free);
   self->pending_capacity = 0;
+  g_mutex_unlock(&self->mutex);
 
   G_OBJECT_CLASS(gpu_texture_gl_parent_class)->dispose(object);
 }
