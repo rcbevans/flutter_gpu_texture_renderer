@@ -39,7 +39,7 @@ import CoreVideo
             }
             // The create hands back a +1 reference for the engine to own.
             CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nil as CFDictionary?, &pixelBuffer)
-            ioSurface.release()
+            CFRelease(ioSurface)
         }
         return pixelBuffer
     }
