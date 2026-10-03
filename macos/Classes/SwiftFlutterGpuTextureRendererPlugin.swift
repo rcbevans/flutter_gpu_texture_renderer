@@ -39,7 +39,8 @@ import CoreVideo
             }
             // The create hands back a +1 reference for the engine to own.
             CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nil as CFDictionary?, &pixelBuffer)
-            CFRelease(ioSurface)
+            // IOSurfaceRef is a managed CF type here; ARC drops the
+            // lookup's +1 at scope exit.
         }
         return pixelBuffer
     }
