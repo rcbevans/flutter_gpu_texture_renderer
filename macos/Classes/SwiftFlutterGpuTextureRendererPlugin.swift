@@ -18,14 +18,18 @@ import CoreVideo
     }
 
     @objc public func markFrameAvaliable(id: UInt32) -> Bool {
+        NSLog("[GpuTex] markFrameAvaliable thread=%@ id=%u", Thread.current, id)
         queue.sync {
             ioSurfaceId = id
         }
+        NSLog("[GpuTex] notify textureFrameAvailable thread=%@", Thread.current)
         registry?.textureFrameAvailable(textureId)
+        NSLog("[GpuTex] notify done thread=%@", Thread.current)
         return true
     }
 
     public func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
+        NSLog("[GpuTex] copyPixelBuffer enter thread=%@", Thread.current)
         var pixelBuffer: Unmanaged<CVPixelBuffer>?
         queue.sync {
             let surfaceId = ioSurfaceId
@@ -42,6 +46,7 @@ import CoreVideo
             // IOSurfaceRef is a managed CF type here; ARC drops the
             // lookup's +1 at scope exit.
         }
+        NSLog("[GpuTex] copyPixelBuffer exit hasBuffer=%@", pixelBuffer != nil ? "y" : "n")
         return pixelBuffer
     }
 
